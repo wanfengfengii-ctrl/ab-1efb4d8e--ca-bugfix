@@ -64,14 +64,16 @@ def uri_in_subtree(uri: str, constraint: str) -> bool:
     return dns_in_subtree(host, c)
 
 
-def _leaf_dns_names(leaf: ParsedCert) -> list[str]:
-    names = list(leaf.san_dns)
-    if not names:
-        # Legacy: treat subject CNs as DNS names when constrained (RFC 5280
-        # §4.2.1.10 guidance).
+def _cert_dns_names(pc: ParsedCert, cn_fallback: bool = False) -> list[str]:
+    names = list(pc.san_dns)
+    if not names and cn_fallback:
+        # Legacy leaf-only convention (RFC 5280 §4.2.1.10 guidance): treat a
+        # leaf's subject CNs as DNS names when it carries no DNS SAN. DNS
+        # constraints never match a non-leaf subject's CN, so intermediate
+        # certificates are matched on SAN entries alone.
         from cryptography.x509.oid import NameOID
 
-        for attr in leaf.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+        for attr in pc.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
             if isinstance(attr.value, str):
                 try:
                     names.append(attr.value.encode("ascii").decode().lower())
@@ -81,8 +83,16 @@ def _leaf_dns_names(leaf: ParsedCert) -> list[str]:
     return names
 
 
+def _cert_uri_names(pc: ParsedCert) -> list[str]:
+    return list(pc.san_uri)
+
+
+def _leaf_dns_names(leaf: ParsedCert) -> list[str]:
+    return _cert_dns_names(leaf, cn_fallback=True)
+
+
 def _leaf_uri_names(leaf: ParsedCert) -> list[str]:
-    return list(leaf.san_uri)
+    return _cert_uri_names(leaf)
 
 
 def leaf_dns_names(leaf: ParsedCert) -> list[str]:
@@ -91,6 +101,64 @@ def leaf_dns_names(leaf: ParsedCert) -> list[str]:
 
 def leaf_uri_names(leaf: ParsedCert) -> list[str]:
     return _leaf_uri_names(leaf)
+
+
+def cert_owned_names(pc: ParsedCert, *, cn_fallback: bool = False
+                     ) -> tuple[list[str], list[str]]:
+    """DNS/URI names a certificate presents for name-constraint matching:
+    its SAN entries. For the leaf only, subject CNs are treated as DNS names
+    when the certificate carries no DNS SAN (legacy CN fallback)."""
+    return _cert_dns_names(pc, cn_fallback=cn_fallback), _cert_uri_names(pc)
+
+
+def _constraint_failure(ca: ParsedCert, dns_names: list[str],
+                        uri_names: list[str], subject: ParsedCert,
+                        absent_name_fails: bool = False) -> dict | None:
+    """One CA's name constraints applied to one constrained subject cert.
+
+    Returns the failure detail (``at`` references the constraining ``ca``,
+    ``name_at`` references the certificate whose name violated) or None.
+    Excluded subtrees take priority over permitted subtrees: every DNS/URI
+    name is checked against exclusions first, then against permitted
+    subtrees, so a name in both is reported as excluded.
+
+    Constraints apply only to names *present* in the subject (RFC 5280
+    §4.2.1.10): an intermediate CA certificate with no SAN has no DNS/URI
+    names and is therefore unconstrained. ``absent_name_fails`` preserves
+    the legacy leaf-only rule that a permitted subtree with no matchable
+    leaf name is a violation.
+    """
+    # Phase 1: exclusions win over permitted subtrees (RFC 5280 §4.2.1.10:
+    # a name in an excluded subtree is rejected regardless of permitted).
+    for name in dns_names:
+        if ca.nc_excluded_dns and any(dns_in_subtree(name, c) for c in ca.nc_excluded_dns):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "name_at": subject.fingerprint,
+                    "kind": "dns_excluded", "name": name}
+    for name in uri_names:
+        if ca.nc_excluded_uri and any(uri_in_subtree(name, c) for c in ca.nc_excluded_uri):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "name_at": subject.fingerprint,
+                    "kind": "uri_excluded", "name": name}
+    # Phase 2: permitted subtrees require at least one matching name type.
+    for name in dns_names:
+        if ca.nc_permitted_dns and not any(
+                dns_in_subtree(name, c) for c in ca.nc_permitted_dns):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "name_at": subject.fingerprint,
+                    "kind": "dns_not_permitted", "name": name}
+    for name in uri_names:
+        if ca.nc_permitted_uri and not any(
+                uri_in_subtree(name, c) for c in ca.nc_permitted_uri):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "name_at": subject.fingerprint,
+                    "kind": "uri_not_permitted", "name": name}
+    if absent_name_fails and not dns_names and not uri_names and (
+            ca.nc_permitted_dns or ca.nc_permitted_uri):
+        return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                "name_at": subject.fingerprint,
+                "kind": "no_name_matching_permitted_subtree"}
+    return None
 
 
 def name_constraint_violation(ca: ParsedCert,
@@ -102,40 +170,47 @@ def name_constraint_violation(ca: ParsedCert,
     this out lets the path finder evaluate the (CA, leaf) verdict once per
     certificate instead of re-walking every name on every candidate path.
     """
-    for name in dns_names:
-        if ca.nc_excluded_dns and any(dns_in_subtree(name, c) for c in ca.nc_excluded_dns):
-            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                    "kind": "dns_excluded", "name": name}
-        if ca.nc_permitted_dns and not any(
-                dns_in_subtree(name, c) for c in ca.nc_permitted_dns):
-            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                    "kind": "dns_not_permitted", "name": name}
-    for name in uri_names:
-        if ca.nc_excluded_uri and any(uri_in_subtree(name, c) for c in ca.nc_excluded_uri):
-            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                    "kind": "uri_excluded", "name": name}
-        if ca.nc_permitted_uri and not any(
-                uri_in_subtree(name, c) for c in ca.nc_permitted_uri):
-            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                    "kind": "uri_not_permitted", "name": name}
-    if not dns_names and not uri_names and (
-            ca.nc_permitted_dns or ca.nc_permitted_uri):
-        return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                "kind": "no_name_matching_permitted_subtree"}
-    return None
+    return _constraint_failure(ca, dns_names, uri_names, ca,
+                               absent_name_fails=True)
+
+
+def cert_name_constraint_violation(ca: ParsedCert, subject: ParsedCert,
+                                   *, cn_fallback: bool = False,
+                                   absent_name_fails: bool = False) -> dict | None:
+    """A CA's name constraints applied to one constrained certificate below
+    it (RFC 5280 §4.2.1.10: constraints apply to every constrained
+    certificate in the path, not only the leaf — typically a non-self-issued
+    intermediate). The caller decides which subjects are constrained;
+    self-issued certificates in non-final positions are exempt and are
+    simply not passed in. ``cn_fallback``/``absent_name_fails`` are leaf-only
+    legacy semantics: match a leaf subject CN as a DNS name when it has no
+    DNS SAN, and reject when the leaf presents no matchable name at all."""
+    dns_names, uri_names = cert_owned_names(subject, cn_fallback=cn_fallback)
+    return _constraint_failure(ca, dns_names, uri_names, subject,
+                               absent_name_fails=absent_name_fails)
 
 
 def check_name_constraints(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, dict | None]:
-    """Every CA's constraints apply to all certificates below it."""
-    leaf = path_leaf_to_root[0]
-    dns_names = _leaf_dns_names(leaf)
-    uri_names = _leaf_uri_names(leaf)
+    """Every CA's constraints apply to all non-self-issued certificates
+    below it (leaf included); a self-issued certificate in a non-final
+    position is exempt (RFC 5280 §4.2.1.10 / §6.1.3 key rollover)."""
     # path[0] leaf, path[1:] issuers; only issuers carry constraints that
-    # constrain the leaf. (A self-issued leaf constraints are irrelevant.)
-    for ca in path_leaf_to_root[1:]:
-        violation = name_constraint_violation(ca, dns_names, uri_names)
-        if violation is not None:
-            return False, violation
+    # constrain certificates below them. (A self-issued leaf's own
+    # constraints are irrelevant.)
+    for i, ca in enumerate(path_leaf_to_root[1:], start=1):
+        for j, subject in enumerate(path_leaf_to_root[:i]):
+            # The leaf (j == 0) is always constrained, including the legacy
+            # CN fallback. A self-issued certificate in a non-final position
+            # is exempt; other intermediates are matched on SAN entries only.
+            if j > 0 and subject.subject_der == subject.issuer_der:
+                continue
+            dns_names, uri_names = cert_owned_names(
+                subject, cn_fallback=(j == 0))
+            violation = _constraint_failure(
+                ca, dns_names, uri_names, subject,
+                absent_name_fails=(j == 0))
+            if violation is not None:
+                return False, violation
     return True, None
 
 

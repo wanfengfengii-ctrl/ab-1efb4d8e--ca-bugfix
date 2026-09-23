@@ -20,7 +20,7 @@ docker compose up -d api1 api2
 
 # 运行一次性验收服务（容器名 verify），跑完即退出
 docker compose run --build verify
-# 期望最后一行：acceptance: 14/14 passed
+# 期望最后一行：acceptance: 16/16 passed
 ```
 
 - 健康检查：`curl -fsS http://127.0.0.1:${API_PORT}/healthz`
@@ -128,8 +128,12 @@ RSA-PSS/ECDSA 校验预哈希（prehashed）摘要；Ed25519 校验 SHA-512 摘�
 - **Extended Key Usage**：叶证书必须含 `id-kp-codeSigning (1.3.6.1.5.5.7.3.3)`；
   任一 CA 若带 EKU 也必须包含 codeSigning。
 - **Name Constraints**：支持 DNS 与 URI（仅这两类 GeneralName，ASCII、
-  大小写不敏感）。permitted/excluded 子树按 RFC 5280 对叶的 SAN
-  （无 SAN 时回退 subject CN）逐跳应用；URI 约束匹配其 host 组件。
+  大小写不敏感）。permitted/excluded 子树按 RFC 5280 对路径中**每一张受约束
+  证书**逐跳应用：既包括叶证书（无 SAN 时回退 subject CN），也包括上级 CA
+  下方所有**非自签发**的中间 CA（仅匹配其 SAN 名称；无 SAN 的中间 CA 不承载
+  可被 DNS/URI 约束匹配的名称）；处于非最终位置的**自签发**中间证书（密钥
+  rollover）享有 RFC 5280 §6.1.3 的既有豁免。excluded 子树优先于 permitted：
+  名称同时命中二者时按 excluded 拒绝。URI 约束匹配其 host 组件。
   其它 GeneralName 类型（email、IP、directoryName 等）→ `UNSUPPORTED`。
 - **证书策略**：完整实现 RFC 5280 §6.1.x 策略树：
   - `certificatePolicies` 逐层交集；

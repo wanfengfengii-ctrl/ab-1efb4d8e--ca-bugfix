@@ -71,6 +71,129 @@ def b64(obj) -> str:
     return base64.b64encode(pf.der(obj)).decode()
 
 
+def _seal_pki(certs, revos, create_id: str, items_id: str, seal_id: str):
+    """Create a fresh evidence set on API1, upload certs/CRLs and seal it."""
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": create_id})
+    sid = r.json()["evidence_set_id"]
+    items = [{"client_ref": ref, "type": "certificate", "content_base64": b64(c)}
+             for ref, c in certs]
+    items += [{"client_ref": ref, "type": kind, "content_base64": b64(o)}
+              for ref, kind, o in revos]
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{sid}/items",
+                   json={"client_request_id": items_id,
+                         "received_at": RECEIVED, "items": items})
+    assert r.status_code == 200, r.text
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{sid}/seal",
+                   json={"client_request_id": seal_id})
+    assert r.status_code == 200, r.text
+    return sid
+
+
+def _adjudication_payload(leaf, leaf_key, anchor, req_id, artifact=b"nc-artifact"):
+    digest = hashlib.sha256(artifact).digest()
+    sig = leaf_key.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    return {"client_request_id": req_id,
+            "artifact_digest": digest.hex(), "signature": sig.hex(),
+            "signature_algorithm": "1.2.840.10045.4.3.2",
+            "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+            "leaf_certificate_sha256": fp_of(pf.der(leaf)),
+            "initial_policies": [ANY],
+            "trust_anchors": [fp_of(pf.der(anchor))]}
+
+
+def _post_adjudication(sid, adj):
+    return httpx.post(f"{API1}/api/v1/evidence-sets/{sid}/adjudications",
+                      json=adj)
+
+
+def _adjudicate(sid, leaf, leaf_key, anchor, req_id, artifact=b"nc-artifact"):
+    return _post_adjudication(
+        sid, _adjudication_payload(leaf, leaf_key, anchor, req_id, artifact))
+
+
+def _acceptance_name_constraints() -> bool:
+    """Root name constraints bind every non-self-issued certificate below
+    the anchor; a non-final self-issued rollover cert stays exempt."""
+    # --- violating scenario: intermediate SAN inside excluded subtree ------
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("NC Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True, nc_excluded_dns=("bad.example",))
+    ca = pf.build_cert("NC Intermediate", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    ca_crl = pf.build_crl(ca, ck, [], last_update=SIGNED - 100,
+                          next_update=SIGNED + 100, crl_number=1)
+    root_crl = pf.build_crl(root, rk, [], last_update=SIGNED - 100,
+                            next_update=SIGNED + 100, crl_number=1)
+    sid = _seal_pki(
+        [("ncr-root", root), ("ncr-ca", ca), ("ncr-leaf", leaf)],
+        [("ncr-ca-crl", "crl", ca_crl), ("ncr-root-crl", "crl", root_crl)],
+        "nc-create", "nc-items", "nc-seal")
+    adj = _adjudication_payload(leaf, lk, root, "nc-adj")
+    r = _post_adjudication(sid, adj)
+    if r.status_code != 201:
+        print("    NC reject adjudicate HTTP", r.status_code, r.text[:300])
+        return False
+    v = r.json()["verdict"]
+    detail = (v.get("failure") or {}).get("detail") or {}
+    ok = (v["status"] == "REJECTED"
+          and v["failed_rule"] == "NAME_CONSTRAINTS"
+          and detail.get("at") == fp_of(pf.der(root))
+          and detail.get("name_at") == fp_of(pf.der(ca))
+          and detail.get("name") == "ca.bad.example")
+    # Deterministic rejection proof: replay of the identical payload is
+    # byte-identical (ECDSA is randomized, so the same body must be reused).
+    r2 = _post_adjudication(sid, adj)
+    ok = ok and r2.status_code == 201 and r2.content == r.content
+    if not ok:
+        print("    NC reject verdict", v)
+    return ok
+
+
+def _acceptance_self_issued_rollover() -> bool:
+    """A self-issued intermediate whose SAN lies in an excluded subtree does
+    not break the path (existing rollover exemption); the leaf is still
+    constrained."""
+    rk, cak, cak2, lk = pf.gen_key(), pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("Rollover Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True, nc_excluded_dns=("bad.example",))
+    ca = pf.build_cert("Shared CA", root, cak, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.allowed.example",))
+    roll = pf.build_cert("Shared CA", ca, cak2, cak, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", roll, lk, cak2,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    crls = [(c, k) for c, k in ((root, rk), (ca, cak), (roll, cak2))]
+    revos = [(f"roll-crl-{i}", "crl",
+              pf.build_crl(c, k, [], last_update=SIGNED - 100,
+                           next_update=SIGNED + 100, crl_number=1))
+             for i, (c, k) in enumerate(crls)]
+    sid = _seal_pki(
+        [("roll-root", root), ("roll-ca", ca),
+         ("roll-self", roll), ("roll-leaf", leaf)],
+        revos, "roll-create", "roll-items", "roll-seal")
+    r = _adjudicate(sid, leaf, lk, root, "roll-adj")
+    if r.status_code != 201:
+        print("    rollover adjudicate HTTP", r.status_code, r.text[:300])
+        return False
+    v = r.json()["verdict"]
+    return (v["status"] == "VALID"
+            and v["selected_path"] == [
+                fp_of(pf.der(leaf)), fp_of(pf.der(roll)),
+                fp_of(pf.der(ca)), fp_of(pf.der(root))])
+
+
 def main() -> int:
     if not wait_ready(API1) or not wait_ready(API2):
         check("both API instances healthy", False,
@@ -188,6 +311,13 @@ def main() -> int:
                fp_of(pf.der(leaf)), fp_of(pf.der(xca)),
                fp_of(pf.der(mid)), fp_of(pf.der(root2))])
     check("cross-signed longer path VALID under alt root", ok2, r.text[:300])
+
+    # --------- name constraints apply to non-self-issued intermediates ----
+    nc_ok = _acceptance_name_constraints()
+    check("intermediate in anchor excluded subtree -> NAME_CONSTRAINTS", nc_ok)
+    roll_ok = _acceptance_self_issued_rollover()
+    check("self-issued rollover intermediate keeps NC exemption -> VALID",
+          roll_ok)
 
     # ------------------------- download package & offline verify ---------
     pkg_ok = False

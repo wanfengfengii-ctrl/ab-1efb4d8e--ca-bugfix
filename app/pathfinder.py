@@ -40,10 +40,8 @@ import heapq
 from .chain import (
     MAX_PATH_DEPTH,
     PolicyInput,
+    cert_name_constraint_violation,
     eku_cert_violation,
-    leaf_dns_names,
-    leaf_uri_names,
-    name_constraint_violation,
     process_policy_inputs,
 )
 from .graph import CertGraph
@@ -53,6 +51,8 @@ from .graph import CertGraph
 #   nc_fail  : dict | None   first name-constraint violation
 #   eku_fail : dict | None   first EKU violation (leaf included at baseline)
 #   ca_count : int           non-self-issued CA certs on the current stack
+#   nc_below : tuple         constrained subject fingerprints on the stack,
+#                            leaf first, self-issued intermediates omitted
 #   policy_proj : tuple      policy-relevant projection, leaf -> current
 #
 # Revocation is deliberately NOT carried here: its engine records an audit
@@ -67,6 +67,7 @@ class _Ctx(NamedTuple):
     nc_fail: dict | None
     eku_fail: dict | None
     ca_count: int
+    nc_below: tuple[str, ...]
     policy_proj: tuple
 
 
@@ -84,19 +85,20 @@ class PathFinder:
         self.path_groups: dict[tuple[str, str, str], dict] = {}
         # Smallest complete failing path overall (length, path) — the
         # deterministic terminal example the proof reports.
-        self._terminal_example: tuple[tuple[str, ...], str, str] | None = None
+        self._terminal_example: tuple[tuple[str, ...], str, str, dict] | None = None
         self.edges_seen: set[tuple[str, str]] = set()
         self._last_good: dict | None = None
         self._intrinsic_cache: dict[tuple[str, bool], dict | None] = {}
         # Per-find caches.
         self._completed: dict[tuple[str, ...], dict | None] = {}
-        self._nc_cache: dict[str, dict | None] = {}
+        # (constraining-CA fp, constrained-subject fp) -> NC verdict. A CA's
+        # constraints apply to every non-self-issued certificate below it
+        # (the leaf always), so the verdict is pairwise, not leaf-fixed.
+        self._nc_pair_cache: dict[tuple[str, str, bool, bool], dict | None] = {}
         self._eku_cache: dict[tuple[str, bool], dict | None] = {}
         self._policy_cache: dict[tuple, tuple] = {}
         self._policy_class: dict[str, tuple] = {}
         self._static_parents_cache: dict[str, list[str]] = {}
-        self._dns_names: list[str] = []
-        self._uri_names: list[str] = []
 
     # --------------------------------------------------------------- nodes
     def _node_intrinsic(self, fp: str, as_issuer: bool) -> dict | None:
@@ -124,11 +126,32 @@ class PathFinder:
     def _rev_conclusion(self, fp: str) -> dict:
         return self.rev(self.g.get_cert(fp))
 
-    def _nc_verdict(self, fp: str) -> dict | None:
-        if fp not in self._nc_cache:
-            self._nc_cache[fp] = name_constraint_violation(
-                self.g.get_cert(fp), self._dns_names, self._uri_names)
-        return self._nc_cache[fp]
+    def _nc_pair_verdict(self, ca_fp: str, subject_fp: str,
+                         cn_fallback: bool = False,
+                         absent_name_fails: bool = False) -> dict | None:
+        key = (ca_fp, subject_fp, cn_fallback, absent_name_fails)
+        if key not in self._nc_pair_cache:
+            self._nc_pair_cache[key] = cert_name_constraint_violation(
+                self.g.get_cert(ca_fp), self.g.get_cert(subject_fp),
+                cn_fallback=cn_fallback, absent_name_fails=absent_name_fails)
+        return self._nc_pair_cache[key]
+
+    def _nc_against_below(self, ca_fp: str, below_fps: tuple[str, ...]) -> dict | None:
+        """A newly appended issuer's constraints applied to every already
+        present constrained subject (leaf→current). Self-issued intermediate
+        subjects are exempt; the leaf (index 0) is always included and gets
+        the legacy subject-CN fallback / no-matchable-name rejection."""
+        for idx, s_fp in enumerate(below_fps):
+            if idx > 0:
+                sp = self.g.get_cert(s_fp)
+                if sp.subject_der == sp.issuer_der:
+                    continue
+            violation = self._nc_pair_verdict(
+                ca_fp, s_fp, cn_fallback=(idx == 0),
+                absent_name_fails=(idx == 0))
+            if violation is not None:
+                return violation
+        return None
 
     def _eku_verdict(self, fp: str, is_leaf: bool) -> dict | None:
         key = (fp, is_leaf)
@@ -154,9 +177,10 @@ class PathFinder:
     def _leaf_context(self, leaf_fp: str) -> _Ctx:
         pc = self.g.get_cert(leaf_fp)
         ca_count = 1 if pc.is_ca and pc.subject_der != pc.issuer_der else 0
+        # The leaf is always a constrained subject for issuers above it.
         return _Ctx(pl_fail=None, nc_fail=None,
                     eku_fail=self._eku_verdict(leaf_fp, is_leaf=True),
-                    ca_count=ca_count,
+                    ca_count=ca_count, nc_below=(leaf_fp,),
                     policy_proj=(self._policy_class_of(leaf_fp),))
 
     def _extend(self, ctx: _Ctx, ip: str) -> _Ctx:
@@ -174,15 +198,22 @@ class PathFinder:
                        "counted_below": ctx.ca_count}
         ca_count = ctx.ca_count + (
             1 if pc.is_ca and pc.subject_der != pc.issuer_der else 0)
-        # Name constraints / EKU: per-cert verdicts, first failure wins.
+        # Name constraints: the new issuer constrains every non-self-issued
+        # subject below it (the leaf always). EKU: per-cert verdict, first
+        # failure wins.
         nc_fail = ctx.nc_fail
         if nc_fail is None:
-            nc_fail = self._nc_verdict(ip)
+            nc_fail = self._nc_against_below(ip, ctx.nc_below)
         eku_fail = ctx.eku_fail
         if eku_fail is None:
             eku_fail = self._eku_verdict(ip, is_leaf=False)
+        # The appended issuer becomes a constrained subject for issuers
+        # above it unless it is self-issued (key-rollover exemption).
+        nc_below = ctx.nc_below
+        if pc.subject_der != pc.issuer_der:
+            nc_below = nc_below + (ip,)
         return _Ctx(pl_fail=pl_fail, nc_fail=nc_fail, eku_fail=eku_fail,
-                    ca_count=ca_count,
+                    ca_count=ca_count, nc_below=nc_below,
                     policy_proj=ctx.policy_proj + (self._policy_class_of(ip),))
 
     def _revocation_fail(self, fps: tuple[str, ...]) -> dict | None:
@@ -268,8 +299,6 @@ class PathFinder:
             return {"status": "REJECTED",
                     "reason": {"rule": "LEAF_NOT_IN_EVIDENCE_SET"},
                     "selected_path": None, "rejection_proof": None}
-        self._dns_names = leaf_dns_names(leaf_pc)
-        self._uri_names = leaf_uri_names(leaf_pc)
         lf = self._node_intrinsic(leaf_fp, as_issuer=False)
         if lf is not None:
             return self._reject(leaf_fp, lf)
@@ -293,10 +322,10 @@ class PathFinder:
                         for (fp, as_issuer), f in self._intrinsic_cache.items()
                         if f is not None]}
         if self._terminal_example is not None:
-            tpath, rule, at = self._terminal_example
+            tpath, rule, at, extra = self._terminal_example
             terminal = {"rule": rule,
                         "detail": {"at": at, "anchor": tpath[-1],
-                                   "example_path": list(tpath)}}
+                                   "example_path": list(tpath), **extra}}
         else:
             terminal = self.node_failures.get(leaf_fp) or {"rule": "NO_PATH_TO_ANCHOR"}
         return self._reject(leaf_fp, terminal)
@@ -398,7 +427,10 @@ class PathFinder:
             if pl_fail is not None:
                 result = pl_fail
             else:
-                nc_fail = ctx.nc_fail or self._nc_verdict(anchor_fp)
+                # The anchor constrains every non-self-issued subject below
+                # it (the leaf always); ctx.nc_fail covers non-anchor issuers.
+                nc_fail = ctx.nc_fail or self._nc_against_below(
+                    anchor_fp, ctx.nc_below)
                 if nc_fail is not None:
                     result = nc_fail
                 else:
@@ -432,11 +464,15 @@ class PathFinder:
         at = detail.get("at", path[-1])
         anchor = path[-1]
         key = (anchor, rule, at)
+        # Rule-specific diagnostics (e.g. the constrained subject and name
+        # for NAME_CONSTRAINTS) are part of every record for this group.
+        extra = {k: v for k, v in detail.items() if k not in ("rule", "at")}
         g = self.path_groups.get(key)
         example = list(path)
         if g is None:
             self.path_groups[key] = {"anchor": anchor, "rule": rule, "at": at,
-                                     "path_count": 1, "example_path": example}
+                                     "path_count": 1, "example_path": example,
+                                     **extra}
         else:
             g["path_count"] += 1
             # Representative: shortest failing path, then lexicographically
@@ -447,10 +483,10 @@ class PathFinder:
         if (self._terminal_example is None
                 or (len(path), path) < (len(self._terminal_example[0]),
                                         self._terminal_example[0])):
-            self._terminal_example = (path, rule, at)
+            self._terminal_example = (path, rule, at, extra)
         edge = (path[-2], path[-1])
         self.edge_failures.setdefault(edge, {"rule": rule, "at": at,
-                                             "path_level": True})
+                                             "path_level": True, **extra})
 
     # ------------------------------------------------------- rejection proof
     def _reject(self, leaf_fp: str, terminal: dict) -> dict:

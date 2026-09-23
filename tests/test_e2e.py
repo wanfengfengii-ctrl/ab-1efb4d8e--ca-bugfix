@@ -411,3 +411,142 @@ def test_stale_evidence_when_window_expired(tmp_path):
     assert res["verdict"]["status"] == "REJECTED"
     snap = {x["certificate"]: x for x in res["revocation_snapshot"]}
     assert snap[fp_of(pf.der(leaf))]["conclusion"] == "STALE"
+
+
+# ---------------------------------------------------------------------------
+# Name constraints must apply to non-self-issued intermediates, not just leaves
+# ---------------------------------------------------------------------------
+
+def _good_crls(h, pairs):
+    for i, (cert, key) in enumerate(pairs):
+        h.add_rev(pf.build_crl(cert, key, [], last_update=SIGNED - 100,
+                               next_update=SIGNED + 100, crl_number=1), i)
+
+
+def _nc_pki():
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True, nc_excluded_dns=("bad.example",))
+    ca = pf.build_cert("Intermediate", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    return root, rk, ca, ck, leaf, lk
+
+
+def test_intermediate_in_excluded_subtree_rejected(tmp_path):
+    """The exact reported scenario: a non-self-issued intermediate whose SAN
+    falls in the anchor's excluded subtree must be rejected even though the
+    leaf name itself is not excluded."""
+    h = Harness(tmp_path)
+    root, rk, ca, ck, leaf, lk = _nc_pki()
+    for c in (root, ca, leaf):
+        h.add_cert(c)
+    _good_crls(h, ((ca, ck), (root, rk)))
+    h.seal()
+    res = h.judge(leaf, fp_of(pf.der(root)), lk)
+    v = res["verdict"]
+    assert v["status"] == "REJECTED", v
+    assert v["failed_rule"] == "NAME_CONSTRAINTS"
+    detail = v["failure"]["detail"]
+    assert detail["at"] == fp_of(pf.der(root))
+    assert detail["name_at"] == fp_of(pf.der(ca))
+    assert detail["kind"] == "dns_excluded"
+    assert detail["name"] == "ca.bad.example"
+    # Deterministic rejection proof: the offending subject and the
+    # path-level NAME_CONSTRAINTS group are recorded.
+    proof = v["rejection_proof"]
+    assert proof is not None
+    groups = [g for g in proof["path_level_failures"]
+              if g["rule"] == "NAME_CONSTRAINTS"]
+    assert any(g["name_at"] == fp_of(pf.der(ca)) for g in groups)
+
+
+def test_intermediate_in_excluded_subtree_package_verifies(tmp_path):
+    """The offline verifier recomputes the REJECTED verdict byte-for-byte."""
+    h = Harness(tmp_path)
+    root, rk, ca, ck, leaf, lk = _nc_pki()
+    for c in (root, ca, leaf):
+        h.add_cert(c)
+    _good_crls(h, ((ca, ck), (root, rk)))
+    manifest = h.seal()
+    res = h.judge(leaf, fp_of(pf.der(root)), lk)
+    assert res["verdict"]["status"] == "REJECTED"
+    pkg = build_package(h.store, res, manifest)
+    p = tmp_path / "rejected_nc.zip"
+    p.write_bytes(pkg)
+    report = verify_package(str(p))
+    assert report["ok"], [c for c in report["checks"] if not c["ok"]]
+
+
+def test_self_issued_rollover_intermediate_nc_exempt_e2e(tmp_path):
+    """A self-issued key-rollover intermediate in a non-final position keeps
+    its exemption: its SAN may lie inside the anchor's excluded subtree
+    without invalidating an otherwise valid path."""
+    h = Harness(tmp_path)
+    rk, cak, cak2, lk = pf.gen_key(), pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True, nc_excluded_dns=("bad.example",))
+    ca = pf.build_cert("Shared CA", root, cak, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.allowed.example",))
+    roll = pf.build_cert("Shared CA", ca, cak2, cak, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", roll, lk, cak2,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    for c in (root, ca, roll, leaf):
+        h.add_cert(c)
+    _good_crls(h, ((root, rk), (ca, cak), (roll, cak2)))
+    h.seal()
+    res = h.judge(leaf, fp_of(pf.der(root)), lk)
+    assert res["verdict"]["status"] == "VALID", res["verdict"]
+    assert res["verdict"]["selected_path"] == [
+        fp_of(pf.der(leaf)), fp_of(pf.der(roll)),
+        fp_of(pf.der(ca)), fp_of(pf.der(root))]
+
+
+def test_cross_signed_branches_nc_independent(tmp_path):
+    """Equivalent cross-signed branches are adjudicated independently: the
+    branch whose intermediate falls in the excluded subtree is rejected,
+    while the equivalent branch under a permissive anchor is accepted."""
+    h = Harness(tmp_path)
+    r1k, r2k = pf.gen_key(), pf.gen_key()
+    cak, lk = pf.gen_key(), pf.gen_key()
+    # Anchor 1 excludes bad.example; its intermediate SAN is inside it.
+    r1 = pf.build_cert("R1", None, r1k, r1k, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       self_signed=True, nc_excluded_dns=("bad.example",))
+    x1 = pf.build_cert("Shared CA", r1, cak, r1k, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    # Anchor 2 has no constraining exclusion; the same subject/key CA is
+    # cross-signed there and valid.
+    r2 = pf.build_cert("R2", None, r2k, r2k, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       self_signed=True)
+    x2 = pf.build_cert("Shared CA", r2, cak, r2k, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", x1, lk, cak,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    for c in (r1, x1, r2, x2, leaf):
+        h.add_cert(c)
+    _good_crls(h, ((r1, r1k), (x1, cak), (r2, r2k), (x2, cak)))
+    h.seal()
+    bad = h.judge(leaf, fp_of(pf.der(r1)), lk)
+    assert bad["verdict"]["status"] == "REJECTED"
+    assert bad["verdict"]["failed_rule"] == "NAME_CONSTRAINTS"
+    good = h.judge(leaf, fp_of(pf.der(r2)), lk)
+    assert good["verdict"]["status"] == "VALID", good["verdict"]
+    assert good["verdict"]["selected_path"] == [
+        fp_of(pf.der(leaf)), fp_of(pf.der(x2)), fp_of(pf.der(r2))]
