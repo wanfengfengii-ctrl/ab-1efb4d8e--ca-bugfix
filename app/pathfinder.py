@@ -18,7 +18,10 @@ that share subject name, key and superior fork the search combinatorially,
 so no gate may cost O(depth) per concrete path:
 
 * intrinsic node gates (validity/basic constraints/key usage) are per node;
-* EKU and name-constraint verdicts (the leaf is fixed) are per certificate;
+* EKU verdicts are per certificate, and name-constraint verdicts are per
+  (constraining CA, constrained subject) pair; the constrained-subject set
+  (the leaf plus every non-self-issued certificate on the prefix) is carried
+  incrementally, so a self-issued non-final certificate never enters it;
 * revocation conclusions are per certificate (engine-side cache);
 * pathLen/name/EKU/revocation state is carried incrementally down the
   leaf→root descent as a constant-size context, so each visited edge costs
@@ -40,20 +43,26 @@ import heapq
 from .chain import (
     MAX_PATH_DEPTH,
     PolicyInput,
+    cert_carries_name_constraints,
     eku_cert_violation,
-    leaf_dns_names,
-    leaf_uri_names,
-    name_constraint_violation,
+    is_self_issued,
+    name_constraint_pair_violation,
     process_policy_inputs,
 )
 from .graph import CertGraph
 
 # Incremental gate context (leaf -> current node), fields:
 #   pl_fail  : dict | None   first pathLen violation (nearest leaf first)
-#   nc_fail  : dict | None   first name-constraint violation
+#   nc_fail  : dict | None   first name-constraint violation; "subject" names
+#                            the constrained certificate and "at" the CA
 #   eku_fail : dict | None   first EKU violation (leaf included at baseline)
 #   ca_count : int           non-self-issued CA certs on the current stack
 #   policy_proj : tuple      policy-relevant projection, leaf -> current
+#
+# Name constraints are pairwise: each newly appended issuer constrains every
+# non-self-issued certificate below it (the final-position leaf is always
+# constrained), so a failure surfaces incrementally like pathLen rather than
+# against one fixed leaf name set.
 #
 # Revocation is deliberately NOT carried here: its engine records an audit
 # snapshot as a side effect, and the legacy semantics evaluate it only on
@@ -68,6 +77,10 @@ class _Ctx(NamedTuple):
     eku_fail: dict | None
     ca_count: int
     policy_proj: tuple
+    # Fingerprints, leaf -> current node, of the certificates on this prefix
+    # that higher issuers must constrain: the leaf (final position, always)
+    # plus every non-self-issued certificate below the current node.
+    nc_subjects: tuple[str, ...]
 
 
 class PathFinder:
@@ -90,13 +103,13 @@ class PathFinder:
         self._intrinsic_cache: dict[tuple[str, bool], dict | None] = {}
         # Per-find caches.
         self._completed: dict[tuple[str, ...], dict | None] = {}
-        self._nc_cache: dict[str, dict | None] = {}
+        # Pairwise name-constraint verdicts keyed (constraining CA fp,
+        # constrained subject fp, is_final_position).
+        self._nc_cache: dict[tuple[str, str, bool], dict | None] = {}
         self._eku_cache: dict[tuple[str, bool], dict | None] = {}
         self._policy_cache: dict[tuple, tuple] = {}
         self._policy_class: dict[str, tuple] = {}
         self._static_parents_cache: dict[str, list[str]] = {}
-        self._dns_names: list[str] = []
-        self._uri_names: list[str] = []
 
     # --------------------------------------------------------------- nodes
     def _node_intrinsic(self, fp: str, as_issuer: bool) -> dict | None:
@@ -124,11 +137,32 @@ class PathFinder:
     def _rev_conclusion(self, fp: str) -> dict:
         return self.rev(self.g.get_cert(fp))
 
-    def _nc_verdict(self, fp: str) -> dict | None:
-        if fp not in self._nc_cache:
-            self._nc_cache[fp] = name_constraint_violation(
-                self.g.get_cert(fp), self._dns_names, self._uri_names)
-        return self._nc_cache[fp]
+    def _nc_pair_verdict(self, ca_fp: str, subject_fp: str,
+                         is_final: bool) -> dict | None:
+        """One constraining CA applied to one constrained subject below it."""
+        key = (ca_fp, subject_fp, is_final)
+        if key not in self._nc_cache:
+            self._nc_cache[key] = name_constraint_pair_violation(
+                self.g.get_cert(ca_fp), self.g.get_cert(subject_fp),
+                is_final=is_final)
+        return self._nc_cache[key]
+
+    def _nc_scan(self, ca_fp: str, subjects: tuple[str, ...]) -> dict | None:
+        """Apply ``ca_fp``'s constraints to every constrained subject on the
+        prefix below it (leaf -> parent order). Only a CA that actually
+        carries a nameConstraints extension costs more than the one field
+        check; depth is bounded by MAX_PATH_DEPTH and each (CA, subject)
+        verdict is memoized across all paths."""
+        ca = self.g.get_cert(ca_fp)
+        if not cert_carries_name_constraints(ca):
+            return None
+        for idx, sfp in enumerate(subjects):
+            violation = self._nc_pair_verdict(ca_fp, sfp, is_final=(idx == 0))
+            if violation is not None:
+                detail = dict(violation)
+                detail["subject"] = sfp
+                return detail
+        return None
 
     def _eku_verdict(self, fp: str, is_leaf: bool) -> dict | None:
         key = (fp, is_leaf)
@@ -157,7 +191,9 @@ class PathFinder:
         return _Ctx(pl_fail=None, nc_fail=None,
                     eku_fail=self._eku_verdict(leaf_fp, is_leaf=True),
                     ca_count=ca_count,
-                    policy_proj=(self._policy_class_of(leaf_fp),))
+                    policy_proj=(self._policy_class_of(leaf_fp),),
+                    # The final-position certificate is always constrained.
+                    nc_subjects=(leaf_fp,))
 
     def _extend(self, ctx: _Ctx, ip: str) -> _Ctx:
         """Context after appending a non-anchor issuer ``ip`` (leaf→root).
@@ -174,16 +210,22 @@ class PathFinder:
                        "counted_below": ctx.ca_count}
         ca_count = ctx.ca_count + (
             1 if pc.is_ca and pc.subject_der != pc.issuer_der else 0)
-        # Name constraints / EKU: per-cert verdicts, first failure wins.
+        # Name constraints: the new issuer constrains every non-self-issued
+        # certificate on the prefix below it (the leaf is always included);
+        # self-issued non-final certificates are exempt (RFC 5280 §4.2.1.10).
         nc_fail = ctx.nc_fail
         if nc_fail is None:
-            nc_fail = self._nc_verdict(ip)
+            nc_fail = self._nc_scan(ip, ctx.nc_subjects)
+        nc_subjects = ctx.nc_subjects
+        if not is_self_issued(pc):
+            nc_subjects = nc_subjects + (ip,)
         eku_fail = ctx.eku_fail
         if eku_fail is None:
             eku_fail = self._eku_verdict(ip, is_leaf=False)
         return _Ctx(pl_fail=pl_fail, nc_fail=nc_fail, eku_fail=eku_fail,
                     ca_count=ca_count,
-                    policy_proj=ctx.policy_proj + (self._policy_class_of(ip),))
+                    policy_proj=ctx.policy_proj + (self._policy_class_of(ip),),
+                    nc_subjects=nc_subjects)
 
     def _revocation_fail(self, fps: tuple[str, ...]) -> dict | None:
         """First non-GOOD certificate in leaf→root order (anchor excluded).
@@ -268,8 +310,6 @@ class PathFinder:
             return {"status": "REJECTED",
                     "reason": {"rule": "LEAF_NOT_IN_EVIDENCE_SET"},
                     "selected_path": None, "rejection_proof": None}
-        self._dns_names = leaf_dns_names(leaf_pc)
-        self._uri_names = leaf_uri_names(leaf_pc)
         lf = self._node_intrinsic(leaf_fp, as_issuer=False)
         if lf is not None:
             return self._reject(leaf_fp, lf)
@@ -398,7 +438,10 @@ class PathFinder:
             if pl_fail is not None:
                 result = pl_fail
             else:
-                nc_fail = ctx.nc_fail or self._nc_verdict(anchor_fp)
+                # The anchor constrains every non-self-issued certificate
+                # below it (leaf always), exactly as any other issuer does.
+                nc_fail = ctx.nc_fail or self._nc_scan(
+                    anchor_fp, ctx.nc_subjects)
                 if nc_fail is not None:
                     result = nc_fail
                 else:

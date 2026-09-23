@@ -64,14 +64,18 @@ def uri_in_subtree(uri: str, constraint: str) -> bool:
     return dns_in_subtree(host, c)
 
 
-def _leaf_dns_names(leaf: ParsedCert) -> list[str]:
-    names = list(leaf.san_dns)
-    if not names:
-        # Legacy: treat subject CNs as DNS names when constrained (RFC 5280
-        # §4.2.1.10 guidance).
+def _cert_dns_names(pc: ParsedCert, cn_fallback: bool = False) -> list[str]:
+    """DNS names a name-constraining CA matches against ``pc``.
+
+    Only the certificate in the final path position (the leaf) falls back to
+    its subject CN when it carries no SAN (RFC 5280 §4.2.1.10 guidance);
+    intermediate CAs are constrained on their SAN alone."""
+    names = list(pc.san_dns)
+    if not names and cn_fallback:
+        # Legacy: treat subject CNs as DNS names for the leaf when constrained.
         from cryptography.x509.oid import NameOID
 
-        for attr in leaf.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+        for attr in pc.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
             if isinstance(attr.value, str):
                 try:
                     names.append(attr.value.encode("ascii").decode().lower())
@@ -81,26 +85,25 @@ def _leaf_dns_names(leaf: ParsedCert) -> list[str]:
     return names
 
 
-def _leaf_uri_names(leaf: ParsedCert) -> list[str]:
-    return list(leaf.san_uri)
-
-
-def leaf_dns_names(leaf: ParsedCert) -> list[str]:
-    return _leaf_dns_names(leaf)
-
-
-def leaf_uri_names(leaf: ParsedCert) -> list[str]:
-    return _leaf_uri_names(leaf)
+def _cert_uri_names(pc: ParsedCert) -> list[str]:
+    return list(pc.san_uri)
 
 
 def name_constraint_violation(ca: ParsedCert,
                               dns_names: list[str],
-                              uri_names: list[str]) -> dict | None:
-    """A single CA's name constraints applied to the fixed leaf names.
+                              uri_names: list[str],
+                              *,
+                              strict_when_no_names: bool = True) -> dict | None:
+    """A single CA's name constraints applied to one constrained certificate.
 
     Returns the failure detail (``at`` references ``ca``) or None. Splitting
-    this out lets the path finder evaluate the (CA, leaf) verdict once per
-    certificate instead of re-walking every name on every candidate path.
+    this out lets the path finder evaluate each (CA, subject) verdict once and
+    memoize it.
+
+    ``strict_when_no_names`` reproduces the leaf profile rule that a permitted
+    subtree with no matching name at all is a violation; non-final subjects
+    follow the per-name-type RFC 5280 semantics, under which a certificate
+    carrying no constrained name is acceptable.
     """
     for name in dns_names:
         if ca.nc_excluded_dns and any(dns_in_subtree(name, c) for c in ca.nc_excluded_dns):
@@ -118,24 +121,59 @@ def name_constraint_violation(ca: ParsedCert,
                 uri_in_subtree(name, c) for c in ca.nc_permitted_uri):
             return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
                     "kind": "uri_not_permitted", "name": name}
-    if not dns_names and not uri_names and (
+    if strict_when_no_names and not dns_names and not uri_names and (
             ca.nc_permitted_dns or ca.nc_permitted_uri):
         return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
                 "kind": "no_name_matching_permitted_subtree"}
     return None
 
 
+def cert_carries_name_constraints(pc: ParsedCert) -> bool:
+    return bool(pc.nc_permitted_dns or pc.nc_permitted_uri
+                or pc.nc_excluded_dns or pc.nc_excluded_uri)
+
+
+def name_constraint_pair_violation(ca: ParsedCert, subject: ParsedCert,
+                                   *, is_final: bool) -> dict | None:
+    """``ca``'s constraints applied to one certificate ``subject`` below it.
+
+    The final path certificate (the leaf) uses CN fallback and the strict
+    empty-name rule; every other subject is matched on SAN names only. The
+    self-issued/non-final exemption is applied by the caller, not here.
+    """
+    dns_names = _cert_dns_names(subject, cn_fallback=is_final)
+    uri_names = _cert_uri_names(subject)
+    return name_constraint_violation(
+        ca, dns_names, uri_names, strict_when_no_names=is_final)
+
+
+def is_self_issued(pc: ParsedCert) -> bool:
+    return pc.subject_der == pc.issuer_der
+
+
 def check_name_constraints(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, dict | None]:
-    """Every CA's constraints apply to all certificates below it."""
-    leaf = path_leaf_to_root[0]
-    dns_names = _leaf_dns_names(leaf)
-    uri_names = _leaf_uri_names(leaf)
-    # path[0] leaf, path[1:] issuers; only issuers carry constraints that
-    # constrain the leaf. (A self-issued leaf constraints are irrelevant.)
-    for ca in path_leaf_to_root[1:]:
-        violation = name_constraint_violation(ca, dns_names, uri_names)
-        if violation is not None:
-            return False, violation
+    """Every CA's constraints apply to every constrained certificate below it.
+
+    RFC 5280 §4.2.1.10: name constraints bound all subsequent (non-self-issued)
+    certificates in the path. A self-issued certificate in a non-final position
+    is exempt; the certificate in the final position (the leaf) is always
+    constrained, even if self-issued. The first failure is reported with the
+    nearest-leaf constraining CA first, ties broken by the nearest-leaf
+    constrained subject — the same order the incremental path search applies.
+    """
+    n = len(path_leaf_to_root)
+    for j in range(1, n):
+        ca = path_leaf_to_root[j]
+        for i in range(j):
+            subject = path_leaf_to_root[i]
+            final = i == 0
+            if not final and is_self_issued(subject):
+                continue
+            violation = name_constraint_pair_violation(ca, subject, is_final=final)
+            if violation is not None:
+                detail = dict(violation)
+                detail["subject"] = subject.fingerprint
+                return False, detail
     return True, None
 
 

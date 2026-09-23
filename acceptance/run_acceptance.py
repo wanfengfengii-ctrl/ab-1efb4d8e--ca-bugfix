@@ -71,6 +71,124 @@ def b64(obj) -> str:
     return base64.b64encode(pf.der(obj)).decode()
 
 
+def _upload_seal_judge(tag, certs, crls, leaf, root, leaf_key,
+                       artifact=b"nc-artifact"):
+    """Create -> upload (api1) -> seal (api2) -> adjudicate (api1) for one
+    isolated evidence set. Returns (ok, detail, response)."""
+    import hashlib as _hashlib
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": f"{tag}-create"})
+    if r.status_code != 201:
+        return False, f"create {r.status_code} {r.text[:200]}", None
+    sid = r.json()["evidence_set_id"]
+    items = [{"client_ref": f"cert-{i}", "type": "certificate",
+              "content_base64": b64(c)} for i, c in enumerate(certs)]
+    items += [{"client_ref": f"crl-{i}", "type": "crl",
+               "content_base64": b64(c)} for i, c in enumerate(crls)]
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{sid}/items",
+                   json={"client_request_id": f"{tag}-items",
+                         "received_at": RECEIVED, "items": items})
+    if r.status_code != 200 or r.json()["accepted"] != len(items):
+        return False, f"items {r.status_code} {r.text[:200]}", None
+    r = httpx.post(f"{API2}/api/v1/evidence-sets/{sid}/seal",
+                   json={"client_request_id": f"{tag}-seal"})
+    if r.status_code != 200:
+        return False, f"seal {r.status_code} {r.text[:200]}", None
+    digest = _hashlib.sha256(artifact).digest()
+    sig = leaf_key.sign(digest, _ec.ECDSA(Prehashed(hashes.SHA256())))
+    adj = {"client_request_id": f"{tag}-adj",
+           "artifact_digest": digest.hex(), "signature": sig.hex(),
+           "signature_algorithm": "1.2.840.10045.4.3.2",
+           "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+           "leaf_certificate_sha256": fp_of(pf.der(leaf)),
+           "initial_policies": [ANY],
+           "trust_anchors": [fp_of(pf.der(root))]}
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{sid}/adjudications", json=adj)
+    if r.status_code != 201:
+        return False, f"adjudicate {r.status_code} {r.text[:200]}", None
+    # Replay on api2 must be byte-identical (deterministic across instances).
+    r2 = httpx.post(f"{API2}/api/v1/evidence-sets/{sid}/adjudications", json=adj)
+    replay_ok = r2.status_code == 201 and r2.content == r.content
+    return True, ("replay byte-identical" if replay_ok
+                  else "REPLAY DIFFERS"), r.json()
+
+
+def _name_constraint_scenarios() -> list[tuple[str, bool, str]]:
+    out: list[tuple[str, bool, str]] = []
+
+    # 1) Non-self-issued intermediate SAN inside the anchor's excluded
+    # subtree while the leaf name is allowed -> REJECTED / NAME_CONSTRAINTS.
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("NC Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_dns=("bad.example",), self_signed=True)
+    ca = pf.build_cert("ca.bad.example", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    crls = [pf.build_crl(ca, ck, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1),
+            pf.build_crl(root, rk, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)]
+    ok, detail, body = _upload_seal_judge(
+        "nc-intermediate", (root, ca, leaf), crls, leaf, root, lk)
+    if ok and body is not None:
+        v = body["verdict"]
+        ok = v["status"] == "REJECTED" and v.get("failed_rule") == "NAME_CONSTRAINTS"
+        detail = f"{v['status']}/{v.get('failed_rule')} ({detail})"
+    out.append(("intermediate CA in excluded subtree -> NAME_CONSTRAINTS",
+                ok, detail))
+
+    # 2) RFC 4158 key-rollover self-issued intermediate carrying a SAN inside
+    # the excluded subtree stays exempt -> VALID.
+    rk2, k1, k1b, k2, lk2 = (pf.gen_key() for _ in range(5))
+    root2 = pf.build_cert("NC Roll Root", None, rk2, rk2, is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                          nc_excluded_dns=("bad.example",), self_signed=True)
+    ca1 = pf.build_cert("Roll CA", root2, k1, rk2, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("roll.good.example",))
+    ca1b = pf.build_cert("Roll CA", ca1, k1b, k1, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         san_dns=("rollover.bad.example",))
+    ca2 = pf.build_cert("Down CA", ca1b, k2, k1b, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("down.good.example",))
+    leaf2 = pf.build_cert("app.good.example", ca2, lk2, k2,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          san_dns=("app.good.example",))
+    rcrl2 = pf.build_crl(root2, rk2, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)
+    mcrl = pf.build_crl(ca1, k1, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=1)
+    ncrl = pf.build_crl(ca1b, k1b, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=1)
+    lcrl = pf.build_crl(ca2, k2, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=1)
+    ok, detail, body = _upload_seal_judge(
+        "nc-rollover", (root2, ca1, ca1b, ca2, leaf2),
+        (rcrl2, mcrl, ncrl, lcrl), leaf2, root2, lk2)
+    if ok and body is not None:
+        v = body["verdict"]
+        ok = v["status"] == "VALID"
+        if ok:
+            ok = v["selected_path"] == [fp_of(pf.der(leaf2)),
+                                        fp_of(pf.der(ca2)),
+                                        fp_of(pf.der(ca1b)),
+                                        fp_of(pf.der(ca1)),
+                                        fp_of(pf.der(root2))]
+        detail = f"{v['status']} ({detail})"
+    out.append(("self-issued rollover intermediate exempt -> VALID",
+                ok, detail))
+    return out
+
+
 def main() -> int:
     if not wait_ready(API1) or not wait_ready(API2):
         check("both API instances healthy", False,
@@ -188,6 +306,11 @@ def main() -> int:
                fp_of(pf.der(leaf)), fp_of(pf.der(xca)),
                fp_of(pf.der(mid)), fp_of(pf.der(root2))])
     check("cross-signed longer path VALID under alt root", ok2, r.text[:300])
+
+    # ---- name constraints bind non-self-issued intermediate CAs too ------
+    nc = _name_constraint_scenarios()
+    for name, ok, detail in nc:
+        check(name, ok, detail)
 
     # ------------------------- download package & offline verify ---------
     pkg_ok = False

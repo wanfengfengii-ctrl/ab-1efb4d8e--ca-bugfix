@@ -88,6 +88,193 @@ def test_uri_name_constraint():
     assert not chain.uri_in_subtree("https://example.com.evil.test/", "example.com")
 
 
+def test_intermediate_dns_name_constrained_by_ancestor():
+    """A non-self-issued intermediate CA's own SAN is bound by every
+    constraining CA above it, even when the leaf name is untouched."""
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_dns=("bad.example",), self_signed=True)
+    ca = pf.build_cert("ca.bad.example", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.bad.example",))
+    leaf = pf.build_cert("allowed.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("allowed.example",))
+    ok, d = chain.check_name_constraints(_chain3(pf.der(root), pf.der(ca), pf.der(leaf)))
+    assert not ok
+    assert d["rule"] == "NAME_CONSTRAINTS"
+    assert d["kind"] == "dns_excluded"
+    assert d["name"] == "ca.bad.example"
+    assert d["at"] == _p(pf.der(root)).fingerprint
+    assert d["subject"] == _p(pf.der(ca)).fingerprint
+
+
+def test_intermediate_dns_not_in_permitted_subtree():
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_permitted_dns=("allowed.example",), self_signed=True)
+    ca = pf.build_cert("ca.elsewhere.test", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("ca.elsewhere.test",))
+    leaf = pf.build_cert("svc.allowed.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("svc.allowed.example",))
+    ok, d = chain.check_name_constraints(_chain3(pf.der(root), pf.der(ca), pf.der(leaf)))
+    assert not ok and d["rule"] == "NAME_CONSTRAINTS"
+    assert d["kind"] == "dns_not_permitted"
+    assert d["subject"] == _p(pf.der(ca)).fingerprint
+
+
+def test_intermediate_uri_name_constrained():
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_uri=("bad.example",), self_signed=True)
+    ca = pf.build_cert("Constrained CA", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_uri=("https://ca.bad.example/ra",))
+    leaf = pf.build_cert("L", ca, lk, ck, key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_uri=("https://app.allowed.example/x",))
+    ok, d = chain.check_name_constraints(_chain3(pf.der(root), pf.der(ca), pf.der(leaf)))
+    assert not ok and d["rule"] == "NAME_CONSTRAINTS"
+    assert d["kind"] == "uri_excluded"
+    assert d["subject"] == _p(pf.der(ca)).fingerprint
+
+
+def test_excluded_subtree_takes_priority_over_permitted():
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_permitted_dns=("example.com",),
+                         nc_excluded_dns=("bad.example.com",),
+                         self_signed=True)
+    ca = pf.build_cert("x.bad.example.com", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                       san_dns=("x.bad.example.com",))
+    leaf = pf.build_cert("L", ca, lk, ck, key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("ok.example.com",))
+    ok, d = chain.check_name_constraints(_chain3(pf.der(root), pf.der(ca), pf.der(leaf)))
+    assert not ok and d["kind"] == "dns_excluded"
+
+
+def test_self_issued_rollover_intermediate_is_exempt():
+    """RFC 5280: a self-issued certificate in a non-final position is not
+    subject to name constraints; a key-rollover CA cert may therefore carry a
+    SAN inside a superior's excluded subtree without invalidating the path."""
+    rk, k1, k2, lk = (pf.gen_key() for _ in range(4))
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_dns=("bad.example",), self_signed=True)
+    ca1 = pf.build_cert("Roll CA", root, k1, rk, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("roll.good.example",))
+    # Self-issued (same subject DN, same key) rollover certificate.
+    ca1b = pf.build_cert("Roll CA", ca1, k1, k1, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         san_dns=("rollover.bad.example",))
+    ca2 = pf.build_cert("Downstream CA", ca1b, k2, k1, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("down.good.example",))
+    leaf = pf.build_cert("app.good.example", ca2, lk, k2,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("app.good.example",))
+    p = [_p(pf.der(leaf)), _p(pf.der(ca2)), _p(pf.der(ca1b)),
+         _p(pf.der(ca1)), _p(pf.der(root))]
+    assert chain.is_self_issued(p[2]) and not chain.is_self_issued(p[1])
+    ok, d = chain.check_name_constraints(p)
+    assert ok, d
+
+
+def test_self_issued_exemption_does_not_shield_lower_non_self_issued():
+    """The root constrains a non-self-issued CA even when an exempt
+    self-issued rollover certificate sits between them on the path."""
+    rk, k1, k1b, k2, lk = (pf.gen_key() for _ in range(5))
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_dns=("bad.example",), self_signed=True)
+    ca1 = pf.build_cert("Roll CA", root, k1, rk, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("roll.good.example",))
+    ca1b = pf.build_cert("Roll CA", ca1, k1b, k1, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         san_dns=("rollover.bad.example",))
+    # Downstream CA below the exempt self-issued cert is NOT exempt.
+    ca2 = pf.build_cert("down.bad.example", ca1b, k2, k1b, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                        san_dns=("down.bad.example",))
+    leaf = pf.build_cert("app.good.example", ca2, lk, k2,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("app.good.example",))
+    p = [_p(pf.der(leaf)), _p(pf.der(ca2)), _p(pf.der(ca1b)),
+         _p(pf.der(ca1)), _p(pf.der(root))]
+    ok, d = chain.check_name_constraints(p)
+    assert not ok and d["rule"] == "NAME_CONSTRAINTS"
+    assert d["subject"] == _p(pf.der(ca2)).fingerprint
+
+
+def test_leaf_excluded_subtree_reports_leaf_subject():
+    """The final-position certificate's own violation reports the leaf as the
+    constrained subject (distinct from an intermediate violation)."""
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_excluded_dns=("bad.example",), self_signed=True)
+    ca = pf.build_cert("C", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    leaf = pf.build_cert("leaf.bad.example", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("leaf.bad.example",))
+    ok, d = chain.check_name_constraints(_chain3(pf.der(root), pf.der(ca), pf.der(leaf)))
+    assert not ok and d["rule"] == "NAME_CONSTRAINTS"
+    assert d["subject"] == _p(pf.der(leaf)).fingerprint
+
+
+def test_leaf_cn_fallback_still_applies():
+    rk, ck, k1, k2 = pf.gen_key(), pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_permitted_dns=("example.com",), self_signed=True)
+    ca = pf.build_cert("C", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    leaf_ok = pf.build_cert("app.example.com", ca, k1, ck,
+                            key_usage=("digitalSignature",),
+                            eku=("codeSigning",), policies=[ANY])
+    leaf_bad = pf.build_cert("app.evil.test", ca, k2, ck,
+                             key_usage=("digitalSignature",),
+                             eku=("codeSigning",), policies=[ANY])
+    assert chain.check_name_constraints(
+        _chain3(pf.der(root), pf.der(ca), pf.der(leaf_ok)))[0]
+    ok, d = chain.check_name_constraints(
+        _chain3(pf.der(root), pf.der(ca), pf.der(leaf_bad)))
+    assert not ok and d["kind"] == "dns_not_permitted"
+
+
+def test_intermediate_without_san_not_overconstrained():
+    """An intermediate carrying no DNS/URI names is not rejected by a
+    permitted-only subtree; the leaf still has to satisfy it."""
+    rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    root = pf.build_cert("R", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         nc_permitted_dns=("example.com",), self_signed=True)
+    ca = pf.build_cert("C", root, ck, rk, is_ca=True,
+                       key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    leaf = pf.build_cert("app.example.com", ca, lk, ck,
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[ANY],
+                         san_dns=("app.example.com",))
+    assert chain.check_name_constraints(
+        _chain3(pf.der(root), pf.der(ca), pf.der(leaf)))[0]
+
+
 def test_eku_code_signing_required():
     rk, ck, lk = pf.gen_key(), pf.gen_key(), pf.gen_key()
     root = pf.build_cert("R", None, rk, rk, is_ca=True,
